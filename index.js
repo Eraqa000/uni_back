@@ -1212,7 +1212,7 @@ async function sendWeeklyTeacherAnalysis() {
 }
 
 // Запускаем задачу каждую пятницу в 18:00
-cron.schedule('0 20 * * 6', sendWeeklyTeacherAnalysis, {
+cron.schedule('10 20 * * 6', sendWeeklyTeacherAnalysis, {
     scheduled: true,
     timezone: "Asia/Almaty" // Укажем нашу таймзону
 });
