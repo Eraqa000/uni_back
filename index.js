@@ -1154,15 +1154,26 @@ async function sendWeeklyTeacherAnalysis() {
         // 4. Находим всех преподавателей и их push-токены
         const { data: teachers, error: teacherError } = await supabase
             .from('staff')
-            .select('id, positions!inner(title)')
-            .like('positions.title', '%преподаватель%');
+            .select(`
+                id, 
+                full_name,
+                positions!inner(title)
+            `)
+            // .ilike регистрге қарамайды. "Преподаватель" сөзі бар кез келген лауазымды табады
+            .ilike('positions.title', '%преподаватель%');
 
-        if (teacherError || !teachers) {
-            console.log('[CRON] Преподаватели не найдены.');
+        if (teacherError) {
+            console.error('[CRON] Қызметкерлерді алу қатесі:', teacherError);
+            return;
+        }
+
+        if (!teachers || teachers.length === 0) {
+            console.log('[CRON] Базадан "преподаватель" лауазымымен ешкім табылмады.');
             return;
         }
 
         const teacherIds = teachers.map(t => t.id);
+        console.log(`[CRON] Табылған мұғалімдер ID-лері: ${teacherIds}`);
         
         const { data: tokens, error: tokenError } = await supabase
             .from('user_push_tokens')
