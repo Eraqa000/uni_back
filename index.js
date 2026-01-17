@@ -1124,6 +1124,7 @@ async function sendWeeklyTeacherAnalysis() {
             .from('weekly_marks')
             .select(`
                 seminar_mark,
+                created_at,
                 profiles ( full_name, groups ( name ) ),
                 subjects ( name )
             `)
