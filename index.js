@@ -1151,6 +1151,21 @@ async function sendWeeklyTeacherAnalysis() {
 
         console.log('[CRON] Сгенерирован отчет от Gemini:', reportText);
 
+        // Сохраняем отчет в базу данных
+        const { error: insertError } = await supabase
+            .from('teacher_reports')
+            .insert([{ 
+                title: 'Еженедельный AI-анализ успеваемости', 
+                report_content: reportText 
+            }]);
+
+        if (insertError) {
+            console.error('[CRON] Ошибка при сохранении отчета в базу данных:', insertError);
+            // Мы не прерываем выполнение, чтобы уведомления все равно отправились
+        } else {
+            console.log('[CRON] Еженедельный отчет успешно сохранен в базу данных.');
+        }
+
         // 4. Находим всех преподавателей и их push-токены
         const { data: teachers, error: teacherError } = await supabase
             .from('staff')
@@ -1212,9 +1227,23 @@ async function sendWeeklyTeacherAnalysis() {
 }
 
 // Запускаем задачу каждую пятницу в 18:00
-cron.schedule('10 20 * * 6', sendWeeklyTeacherAnalysis, {
+cron.schedule('35 13 * * 1', sendWeeklyTeacherAnalysis, {
     scheduled: true,
     timezone: "Asia/Almaty" // Укажем нашу таймзону
+});
+
+app.get('/api/teacher/reports', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('teacher_reports')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 
