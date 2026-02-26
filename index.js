@@ -1,3 +1,5 @@
+// backend/index.js
+
 const express = require('express');
 const cors = require('cors');
 const { Expo } = require('expo-server-sdk');
@@ -933,7 +935,6 @@ app.get('/api/teacher/dashboard/:teacherId', async (req, res) => {
 });
 
 
-// backend/index.js
 app.post('/api/teacher/mark-attendance', async (req, res) => {
     const { schedule_id, date, attendance_data } = req.body;
 
@@ -973,7 +974,7 @@ app.get('/api/teacher/lesson-students/:scheduleId', async (req, res) => {
     const { scheduleId } = req.params;
 
     try {
-        // 1. Сабақ арқылы топтарды табамыз
+        // 1. Сабаққа байланған топтарды алу
         const { data: scheduleGroups, error: groupError } = await supabase
             .from('schedule_groups')
             .select('group_id')
@@ -981,9 +982,14 @@ app.get('/api/teacher/lesson-students/:scheduleId', async (req, res) => {
 
         if (groupError) throw groupError;
 
+        // Егер топтар табылмаса, бірден бос тізім қайтару
+        if (!scheduleGroups || scheduleGroups.length === 0) {
+            return res.json([]);
+        }
+
         const groupIds = scheduleGroups.map(sg => sg.group_id);
 
-        // 2. Сол топтағы студенттерді (profiles) аламыз
+        // 2. Студенттерді алу (Profiles кестесінен)
         const { data: students, error: studentError } = await supabase
             .from('profiles')
             .select('id, full_name')
@@ -994,7 +1000,8 @@ app.get('/api/teacher/lesson-students/:scheduleId', async (req, res) => {
 
         res.json(students);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('[API Error] Student fetch failed:', err.message);
+        res.status(500).json({ error: 'Серверде қате орын алды' });
     }
 });
 
@@ -1109,6 +1116,31 @@ app.post('/api/teacher/save-weekly-marks', async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
+});
+
+//детали балла для студента(subject-details.tsx)
+app.get('/api/student/subject-marks/:studentId/:subjectId', async (req, res) => {
+  const { studentId, subjectId } = req.params;
+
+  // Параметрлердің бар екенін және UUID форматында екенін тексеру
+  if (!studentId || !subjectId || subjectId === 'undefined') {
+    console.error('[API Error] Missing IDs:', { studentId, subjectId });
+    return res.status(400).json({ error: 'Жарамсыз studentId немесе subjectId' });
+  }
+
+  try {
+    const { data, error } = await supabase
+        .from('weekly_marks')
+        .select('week_number, seminar_mark, lecture_mark, srs_mark, created_at')
+        .eq('student_id', studentId)
+        .eq('subject_id', subjectId) // Сүзгі нақты осы пәнге ғана бағытталуы тиіс
+        .order('week_number', { ascending: true });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --- ЕЖЕНЕДЕЛЬНЫЙ АНАЛИЗ ДЛЯ ПРЕПОДАВАТЕЛЕЙ ---
@@ -1227,7 +1259,7 @@ async function sendWeeklyTeacherAnalysis() {
 }
 
 // Запускаем задачу каждую пятницу в 18:00
-cron.schedule('35 13 * * 1', sendWeeklyTeacherAnalysis, {
+cron.schedule('14 23 * * 1', sendWeeklyTeacherAnalysis, {
     scheduled: true,
     timezone: "Asia/Almaty" // Укажем нашу таймзону
 });
