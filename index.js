@@ -79,9 +79,10 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
 
+// Тестовый эндпоинт для проверки работоспособности сервера
 app.get('/', (req, res) => res.send('University Backend is running'));
 
-
+// Эндпоинт для авторизации
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
 
@@ -130,6 +131,7 @@ app.post('/api/login', async (req, res) => {
     });
 });
 
+// Эндпоинт для получения информации о текущем пользователе (для фронтенда после авторизации)
 app.get('/api/auth/me', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -168,6 +170,261 @@ app.get('/api/auth/me', async (req, res) => {
   }
 });
 
+
+// Эндпоинт для регистрации устройства (для ограничения доступа с незарегистрированных устройств)
+app.post('/api/auth/register-device', authenticateUser, async (req, res) => {
+    const { device_id } = req.body;
+    const userId = req.user.id;
+
+    try {
+        // 1. Ищем в таблице студентов (profiles)
+        const { data: profile } = await supabase
+            .from('profiles')
+            .select('device_id')
+            .eq('id', userId)
+            .maybeSingle(); // maybeSingle не кидает ошибку, если запись не найдена
+
+        if (profile) {
+            // Если это студент, проверяем device_id
+            if (profile.device_id && profile.device_id !== device_id) {
+                return res.status(403).json({ 
+                    error: 'Устройство заблокировано. Студенты входят только с одного устройства.' 
+                });
+            }
+
+            // Обновляем/регистрируем ID
+            const { error: updateError } = await supabase
+                .from('profiles')
+                .update({ device_id: device_id })
+                .eq('id', userId);
+
+            if (updateError) throw updateError;
+            return res.json({ success: true, message: 'Устройство студента зарегистрировано' });
+        }
+
+        // 2. Если в profiles не нашли, ищем в staff
+        const { data: staffMember } = await supabase
+            .from('staff')
+            .select('id')
+            .eq('id', userId)
+            .maybeSingle();
+
+        if (staffMember) {
+            // Для сотрудников просто возвращаем успех
+            return res.json({ success: true, message: 'Для сотрудников привязка не требуется' });
+        }
+
+        // 3. Если пользователя нет ни в одной таблице
+        return res.status(404).json({ error: 'Пользователь не найден' });
+
+    } catch (error) {
+        console.error('Register Device Error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Эндпоинт для получения списка кабинетов (для админ-панели)
+app.get('/api/admin/rooms', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('rooms')
+            .select('*')
+            .order('room_number', { ascending: true });
+
+        if (error) throw error;
+
+        res.json(data);
+    } catch (error) {
+        console.error('Error fetching rooms:', error.message);
+        res.status(500).json({ error: 'Не удалось загрузить список кабинетов' });
+    }
+});
+
+// Эндпоинт для сканирования QR-кода и отметки посещаемости
+app.post('/api/attendance/scan-qr', authenticateUser, async (req, res) => {
+    const { qr_code, action } = req.body; // action: 'check_in' или 'check_out'
+    const userId = req.user.id;
+
+    try {
+        // 1. Находим кабинет по QR-коду
+        const { data: roomQR, error: qrError } = await supabase
+            .from('room_qr_codes')
+            .select(`
+                room_id,
+                rooms ( room_number )
+            `)
+            .eq('qr_code', qr_code)
+            .eq('is_active', true)
+            .single();
+
+        if (qrError || !roomQR) {
+            return res.status(404).json({ error: 'QR-код не найден или неактивен' });
+        }
+
+        // 2. Определяем текущее время и день недели
+        const now = new Date();
+        const currentDay = now.getDay(); // 1-7 (Пн-Вс)
+        const currentTime = now.toTimeString().slice(0, 8); // HH:MM:SS
+        const today = now.toISOString().split('T')[0]; // YYYY-MM-DD
+
+        // 3. Ищем текущее занятие в этом кабинете
+        const { data: currentSchedule, error: schedError } = await supabase
+            .from('schedule')
+            .select(`
+                id,
+                subject_id,
+                subjects ( name ),
+                time_slots ( start_time, end_time ),
+                schedule_groups ( 
+                    groups ( id )
+                )
+            `)
+            .eq('room_id', roomQR.room_id)
+            .eq('day_of_week', currentDay)
+            .lte('time_slots.start_time', currentTime)
+            .gte('time_slots.end_time', currentTime);
+
+        if (!currentSchedule || currentSchedule.length === 0) {
+            return res.status(400).json({ 
+                error: 'Сейчас в кабинете нет занятий или занятие не началось',
+                room: roomQR.rooms.room_number 
+            });
+        }
+
+        // 4. Проверяем, что студент принадлежит к группе этого занятия
+        const { data: studentProfile } = await supabase
+            .from('profiles')
+            .select('group_id, full_name')
+            .eq('id', userId)
+            .single();
+
+        const allowedGroups = currentSchedule[0].schedule_groups.map(sg => sg.groups.id);
+        
+        if (!allowedGroups.includes(studentProfile.group_id)) {
+            return res.status(403).json({ 
+                error: 'У вас нет занятий в этом кабинете сейчас',
+                room: roomQR.rooms.room_number 
+            });
+        }
+
+        // 5. Отмечаем посещаемость
+        const scheduleId = currentSchedule[0].id;
+
+        if (action === 'check_in') {
+            const { error: attendanceError } = await supabase
+                .from('attendance')
+                .upsert({
+                    schedule_id: scheduleId,
+                    student_id: userId,
+                    status: 'present',
+                    date: today,
+                    check_in_time: now.toISOString(),
+                    qr_code_used: qr_code
+                }, { onConflict: 'schedule_id,student_id,date' });
+
+            if (attendanceError) throw attendanceError;
+
+            res.json({
+                success: true,
+                message: `Добро пожаловать на "${currentSchedule[0].subjects.name}"!`,
+                action: 'checked_in',
+                room: roomQR.rooms.room_number,
+                subject: currentSchedule[0].subjects.name
+            });
+
+        } else if (action === 'check_out') {
+            const { error: updateError } = await supabase
+                .from('attendance')
+                .update({ check_out_time: now.toISOString() })
+                .eq('schedule_id', scheduleId)
+                .eq('student_id', userId)
+                .eq('date', today);
+
+            if (updateError) throw updateError;
+
+            res.json({
+                success: true,
+                message: 'Вы вышли с занятия',
+                action: 'checked_out'
+            });
+        }
+
+    } catch (error) {
+        console.error('QR Scan Error:', error);
+        res.status(500).json({ error: 'Ошибка при обработке QR-кода' });
+    }
+});
+
+// === ГЕНЕРАЦИЯ QR-КОДОВ ДЛЯ КАБИНЕТОВ (Админ) ===
+app.post('/api/admin/generate-room-qr', authenticateUser, async (req, res) => {
+    const { room_id } = req.body;
+
+    try {
+        // Генерируем уникальный QR-код
+        const qrCode = `ROOM_${room_id}_${crypto.randomBytes(8).toString('hex')}`;
+
+        const { data, error } = await supabase
+            .from('room_qr_codes')
+            .insert([{
+                room_id: room_id,
+                qr_code: qrCode
+            }])
+            .select(`
+                qr_code,
+                rooms ( room_number )
+            `)
+            .single();
+
+        if (error) throw error;
+
+        res.json({ 
+            success: true, 
+            qr_code: qrCode,
+            room: data.rooms.room_number 
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// === СТАТИСТИКА ПОСЕЩАЕМОСТИ ДЛЯ ПРЕПОДАВАТЕЛЕЙ ===
+app.get('/api/teacher/attendance-stats/:scheduleId', async (req, res) => {
+    const { scheduleId } = req.params;
+    const { date } = req.query; // Опциональная дата
+
+    try {
+        let query = supabase
+            .from('attendance')
+            .select(`
+                student_id,
+                status,
+                check_in_time,
+                check_out_time,
+                profiles ( full_name )
+            `)
+            .eq('schedule_id', scheduleId);
+
+        if (date) {
+            query = query.eq('date', date);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        const stats = {
+            total_students: data.length,
+            present: data.filter(a => a.status === 'present').length,
+            absent: data.filter(a => a.status === 'absent').length,
+            attendance_details: data
+        };
+
+        res.json(stats);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Эндпоинт для получения профиля пользователя
 app.get('/api/profile/:id', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -197,6 +454,7 @@ app.get('/api/profile/:id', async (req, res) => {
     }
 });
 
+// Эндпоинт для создания студента (для замдекана)
 app.post('/api/create-student', async (req, res) => {
     const { email, password, full_name, group_id, is_grantee } = req.body;
     
@@ -226,7 +484,7 @@ app.post('/api/create-student', async (req, res) => {
     }
 });
 
-// backend/index.js
+// Эндпоинт для получения всех кафедр
 app.get('/api/departments', async (req, res) => {
     console.log("Запрос на получение кафедр получен"); // Это лог в терминале бэкенда
     try {
@@ -247,7 +505,7 @@ app.get('/api/departments', async (req, res) => {
     }
 });
 
-
+// Эндпоинт для получения профессий по ID кафедры
 app.get('/api/professions/:deptId', async (req, res) => {
     const { deptId } = req.params;
     try {
@@ -264,6 +522,7 @@ app.get('/api/professions/:deptId', async (req, res) => {
     }
 });
 
+// Эндпоинт для получения групп по ID программы
 app.get('/api/groups/:profId', async (req, res) => {
     const { profId } = req.params;
     console.log("Запрос групп для программы ID:", profId);
@@ -286,7 +545,7 @@ app.get('/api/groups/:profId', async (req, res) => {
 });
 
 // Эндпоинт для получения оценок студента по предметам (РК1 и РК2)
-// ВАЖНО: Требует создания RPC функции 'get_student_marks' в базе данных Supabase.
+// ВАЖНО: Требует создания RPC функции 'get_student_marks' в базе данных 
 app.get('/api/marks/:userId', async (req, res) => {
     const { userId } = req.params;
     try {
@@ -345,7 +604,7 @@ app.get('/api/schedule/:groupId', async (req, res) => {
     }
 });
 
-
+// Эндпоинт для массовой регистрации студентов (для замдекана)
 app.post('/api/mass-register', async (req, res) => {
     const { profession_id, course, prefix, students } = req.body;
     
@@ -495,6 +754,7 @@ app.get('/api/admin/faculty-stats', async (req, res) => {
     }
 });
 
+// Эндпоинт для анализа рисков по успеваемости студентов (для деканата)
 app.get('/api/admin/risk-analysis', async (req, res) => {
     try {
         // 1. Получаем список студентов, у которых есть оценки ниже 50 баллов
@@ -527,11 +787,13 @@ app.get('/api/admin/risk-analysis', async (req, res) => {
     }
 });
 
+// Логирование всех входящих запросов для отладки
 app.use((req, res, next) => {
     console.log(`${req.method} запрос на ${req.url}`);
     next();
 });
 
+// Эндпоинт для AI-чата
 app.post('/api/ai/chat', async (req, res) => {
     console.log("1. Запрос получен. Тело:", req.body);
     const { userId, message } = req.body;
@@ -636,6 +898,7 @@ app.get('/api/ai/history/:userId', async (req, res) => {
     res.json(data);
 });
 
+// Эндпоинт для анализа успеваемости студента и выдачи рекомендаций (для студентов и преподавателей)
 app.get('/api/ai/analyze-performance/:userId', async (req, res) => {
     const { userId } = req.params;
 
@@ -792,6 +1055,7 @@ app.get('/api/admin/check-room', async (req, res) => {
     }
 });
 
+// 5. Расписание генерациясы (Тек замдеканға рұқсат)
 app.post('/api/generate-schedule', authenticateUser, async (req, res) => {
     // Получаем роль пользователя из предыдущего middleware
     const { data: userData, error: userError } = await supabase
@@ -847,6 +1111,7 @@ app.post('/api/generate-schedule', authenticateUser, async (req, res) => {
     });
 });
 
+// Эндпоинт для получения расписания конкретного преподавателя (Teacher Schedule)
 app.get('/api/teacher/schedule/:teacherId', async (req, res) => {
     const { teacherId } = req.params;
 
@@ -894,7 +1159,7 @@ app.get('/api/teacher/schedule/:teacherId', async (req, res) => {
     }
 });
 
-
+// Эндпоинт для получения данных для Teacher Dashboard
 app.get('/api/teacher/dashboard/:teacherId', async (req, res) => {
     const { teacherId } = req.params;
     const today = new Date().getDay(); // Бүгінгі апта күні (1-5)
@@ -934,7 +1199,7 @@ app.get('/api/teacher/dashboard/:teacherId', async (req, res) => {
     }
 });
 
-
+// Мұғалімнің сабаққа қатысқан студенттерге белгі қоюы (MarkAttendance бетіне қажет)
 app.post('/api/teacher/mark-attendance', async (req, res) => {
     const { schedule_id, date, attendance_data } = req.body;
 
@@ -1085,7 +1350,7 @@ async function sendNewMarksNotifications(marks, subject_id, week_number) {
     }
 }
 
-
+// Эндпоинт для сохранения еженедельных оценок (TeacherWeeklyMarks)
 app.post('/api/teacher/save-weekly-marks', async (req, res) => {
     const { subject_id, week_number, marks } = req.body;
 
@@ -1143,8 +1408,87 @@ app.get('/api/student/subject-marks/:studentId/:subjectId', async (req, res) => 
   }
 });
 
-// --- ЕЖЕНЕДЕЛЬНЫЙ АНАЛИЗ ДЛЯ ПРЕПОДАВАТЕЛЕЙ ---
 
+// Рекомендации курсов для студента
+app.get('/api/student/course-recommendations/:studentId', authenticateUser, async (req, res) => {
+    const { studentId } = req.params;
+
+    try {
+        // 1. Профиль студента
+        const { data: profile } = await supabase
+            .from('profiles')
+            .select('full_name')
+            .eq('id', studentId)
+            .single();
+
+        if (!profile) return res.status(404).json({ error: 'Студент не найден' });
+
+        // 2. Дисциплины + оценки из weekly_marks
+        const { data: marks, error } = await supabase
+            .from('weekly_marks')
+            .select(`seminar_mark, lecture_mark, subjects ( id, name, semester )`)
+            .eq('student_id', studentId);
+
+        if (error) throw error;
+        if (!marks?.length) return res.json({ recommendations: [] });
+
+        // 3. Группируем по предметам, считаем средний балл
+        const subjectsMap = {};
+        for (const m of marks) {
+            const id = m.subjects.id;
+            if (!subjectsMap[id]) {
+                subjectsMap[id] = {
+                    id,
+                    name: m.subjects.name,
+                    semester: m.subjects.semester,
+                    marks: []
+                };
+            }
+            const avg = ((m.seminar_mark || 0) + (m.lecture_mark || 0)) / 2;
+            subjectsMap[id].marks.push(avg);
+        }
+
+        const subjects = Object.values(subjectsMap).map(s => ({
+            id: s.id,
+            name: s.name,
+            semester: s.semester,
+            avg_mark: Math.round(s.marks.reduce((a, b) => a + b, 0) / s.marks.length)
+        }));
+
+        // 4. Запускаем Python агент
+        const inputData = { student_name: profile.full_name, subjects };
+
+        const python = spawn('python3', ['course_agent/agent.py']);
+        python.stdin.write(JSON.stringify(inputData));
+        python.stdin.end();
+
+        let output = '';
+        let errorOutput = '';
+        python.stdout.on('data', d => output += d.toString());
+        python.stderr.on('data', d => errorOutput += d.toString());
+
+        python.on('close', (code) => {
+            console.log('[Agent logs]:', errorOutput);
+            try {
+                const recommendations = JSON.parse(output);
+                res.json({ recommendations });
+            } catch {
+                res.status(500).json({ error: 'Ошибка агента' });
+            }
+        });
+
+        python.on('error', (err) => {
+            res.status(500).json({ error: 'Python не найден: ' + err.message });
+        });
+
+    } catch (error) {
+        console.error('Course recommendation error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+
+// --- ЕЖЕНЕДЕЛЬНЫЙ АНАЛИЗ ДЛЯ ПРЕПОДАВАТЕЛЕЙ ---
 async function sendWeeklyTeacherAnalysis() {
     console.log('--- [CRON] Запуск еженедельного анализа для преподавателей ---');
 
@@ -1258,6 +1602,7 @@ async function sendWeeklyTeacherAnalysis() {
     }
 }
 
+// еженедельный анализ для преподавателей - Крон
 // Запускаем задачу каждую пятницу в 18:00
 cron.schedule('14 23 * * 1', sendWeeklyTeacherAnalysis, {
     scheduled: true,
