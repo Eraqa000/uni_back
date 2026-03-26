@@ -1623,5 +1623,179 @@ app.get('/api/teacher/reports', async (req, res) => {
     }
 });
 
+// =============================================
+// === 📚 УМКД / ПОӘК ЭНДПОИНТТЕРІ ===
+// =============================================
+
+// Студенттің пәндер тізімі + УМКД бар-жоғы
+app.get('/api/umkd/student/:studentId', authenticateUser, async (req, res) => {
+    try {
+        const { studentId } = req.params;
+
+        // Студенттің тобын аламыз
+        const { data: profile, error: profileError } = await supabase
+            .from('profiles')
+            .select('group_id')
+            .eq('id', studentId)
+            .single();
+
+        if (profileError || !profile?.group_id) {
+            return res.status(404).json({ error: 'Студент немесе топ табылмады' });
+        }
+
+        // Топтың бағдарламасын аламыз
+        const { data: group, error: groupError } = await supabase
+            .from('groups')
+            .select('program_id, academic_year')
+            .eq('id', profile.group_id)
+            .single();
+
+        if (groupError || !group?.program_id) {
+            return res.status(404).json({ error: 'Топтың бағдарламасы табылмады' });
+        }
+
+        // Бағдарламаға байланысты пәндерді аламыз
+        const { data: programSubjects, error: psError } = await supabase
+            .from('program_subjects')
+            .select('subject_id, subjects(id, name)')
+            .eq('program_id', group.program_id);
+
+        if (psError) throw psError;
+
+        const subjectIds = programSubjects.map(ps => ps.subject_id);
+
+        // Осы пәндер бойынша УМКД бар-жоғын тексереміз
+        const { data: umkdList } = await supabase
+            .from('umkd')
+            .select('id, subject_id')
+            .in('subject_id', subjectIds)
+            .eq('academic_year', group.academic_year);
+
+        const umkdMap = {};
+        (umkdList || []).forEach(u => { umkdMap[u.subject_id] = u.id; });
+
+        const result = programSubjects.map(ps => ({
+            subject_id: ps.subject_id,
+            subject_name: ps.subjects?.name,
+            umkd_id: umkdMap[ps.subject_id] || null,
+        }));
+
+        res.json(result);
+    } catch (error) {
+        console.error('getUmkdForStudent error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Пән бойынша УМКД мазмұны (барлық материалдармен)
+app.get('/api/umkd/subject/:subjectId', authenticateUser, async (req, res) => {
+    try {
+        const { subjectId } = req.params;
+
+        const { data: umkd, error } = await supabase
+            .from('umkd')
+            .select('id, description, semester, academic_year, teacher_id')
+            .eq('subject_id', subjectId)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (error || !umkd) {
+            return res.json(null);
+        }
+
+        const { data: materials, error: matError } = await supabase
+            .from('umkd_materials')
+            .select('id, title, type, file_url, content, order_index')
+            .eq('umkd_id', umkd.id)
+            .order('order_index', { ascending: true });
+
+        if (matError) throw matError;
+
+        res.json({ ...umkd, materials: materials || [] });
+    } catch (error) {
+        console.error('getUmkdBySubject error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// УМКД жасау немесе жаңарту (оқытушы/әкімші)
+app.post('/api/umkd', authenticateUser, async (req, res) => {
+    try {
+        const { subject_id, semester, academic_year, description } = req.body;
+
+        if (!subject_id || !semester || !academic_year) {
+            return res.status(400).json({ error: 'subject_id, semester, academic_year міндетті' });
+        }
+
+        const { data, error } = await supabase
+            .from('umkd')
+            .upsert(
+                { subject_id, semester, academic_year, description, teacher_id: req.user.id },
+                { onConflict: 'subject_id,semester,academic_year' }
+            )
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error) {
+        console.error('upsertUmkd error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// УМКД-ға материал қосу
+app.post('/api/umkd/material', authenticateUser, async (req, res) => {
+    try {
+        const { umkd_id, title, type, file_url, content } = req.body;
+
+        if (!umkd_id || !title || !type) {
+            return res.status(400).json({ error: 'umkd_id, title, type міндетті' });
+        }
+
+        const VALID_TYPES = ['syllabus', 'lecture', 'seminar', 'lab', 'rk', 'exam', 'srs', 'other'];
+        if (!VALID_TYPES.includes(type)) {
+            return res.status(400).json({ error: 'Жарамсыз материал түрі' });
+        }
+
+        // order_index автоматты түрде ең соңына қою
+        const { count } = await supabase
+            .from('umkd_materials')
+            .select('id', { count: 'exact', head: true })
+            .eq('umkd_id', umkd_id);
+
+        const { data, error } = await supabase
+            .from('umkd_materials')
+            .insert({ umkd_id, title, type, file_url, content, order_index: count || 0 })
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error) {
+        console.error('addUmkdMaterial error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Материалды жою
+app.delete('/api/umkd/material/:id', authenticateUser, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const { error } = await supabase
+            .from('umkd_materials')
+            .delete()
+            .eq('id', id);
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (error) {
+        console.error('deleteUmkdMaterial error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 
 app.listen(process.env.PORT, () => console.log(`Server on port ${process.env.PORT}`));
