@@ -886,6 +886,109 @@ app.post('/api/ai/chat', async (req, res) => {
     }
 });
 
+// Эндпоинт AI-чата для преподавателей
+app.post('/api/ai/teacher-chat', async (req, res) => {
+    const { userId, message } = req.body;
+
+    if (!userId || !message) {
+        return res.status(400).json({ error: "Не указан userId или message" });
+    }
+
+    try {
+        // 1. Профиль преподавателя из таблицы staff
+        const { data: profile, error: profileError } = await supabase
+            .from('staff')
+            .select('full_name, positions(title)')
+            .eq('id', userId)
+            .single();
+
+        if (profileError) throw profileError;
+
+        // 2. Предметы и группы преподавателя из расписания
+        const { data: scheduleItems } = await supabase
+            .from('schedule')
+            .select(`
+                subject_id,
+                subjects ( name ),
+                schedule_groups ( groups ( name ) )
+            `)
+            .eq('teacher_id', userId);
+
+        const subjectMap = {};
+        (scheduleItems || []).forEach(item => {
+            const subjectName = item.subjects?.name;
+            if (!subjectName) return;
+            if (!subjectMap[subjectName]) subjectMap[subjectName] = new Set();
+            (item.schedule_groups || []).forEach(sg => {
+                if (sg.groups?.name) subjectMap[subjectName].add(sg.groups.name);
+            });
+        });
+        const subjectsSummary = Object.entries(subjectMap)
+            .map(([subj, groups]) => `${subj} (${[...groups].join(', ')})`)
+            .join('; ') || 'Данных нет';
+
+        // 3. Краткая статистика посещаемости по предметам преподавателя
+        const subjectIds = [...new Set((scheduleItems || []).map(s => s.subject_id).filter(Boolean))];
+        let attendanceSummary = 'Данных нет';
+        if (subjectIds.length > 0) {
+            const { data: attData } = await supabase
+                .from('attendance')
+                .select('status, schedule:schedule_id ( subject_id )')
+                .in('schedule.subject_id', subjectIds)
+                .limit(200);
+            if (attData && attData.length > 0) {
+                const total = attData.length;
+                const present = attData.filter(a => a.status === 'present').length;
+                attendanceSummary = `${present} из ${total} (${Math.round(present / total * 100)}% посещаемость)`;
+            }
+        }
+
+        // 4. История чата (последние 6 сообщений)
+        const { data: history } = await supabase
+            .from('chat_history')
+            .select('role, message')
+            .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(6);
+
+        let formattedHistory = history ? history.reverse().map(h => ({
+            role: h.role === 'user' ? 'user' : 'model',
+            parts: [{ text: h.message }],
+        })) : [];
+
+        if (formattedHistory.length > 0 && formattedHistory[0].role === 'model') {
+            formattedHistory.shift();
+        }
+
+        // 5. Системная инструкция для преподавателя
+        const position = profile?.positions?.title || 'Преподаватель';
+        const systemInstruction = `Ты — AI-ассистент университета 'Univer' для преподавателей.
+        Преподаватель: ${profile?.full_name}, должность: ${position}.
+        Ведёт предметы: ${subjectsSummary}.
+        Статистика посещаемости: ${attendanceSummary}.
+        Твоя задача:отвечать на вопросы и помогать преподавателю анализировать успеваемость студентов, давать советы по методике преподавания, отвечать на вопросы об учебном процессе. Будь краток и профессионален.`;
+
+        const teacherModel = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+        const chat = teacherModel.startChat({ history: formattedHistory });
+        const fullPrompt = `System Instruction: ${systemInstruction}\n\nUser Question: ${message}`;
+
+        const result = await chat.sendMessage(fullPrompt);
+        const aiResponse = result.response.text();
+
+        // 6. Сохранение в историю
+        await supabase.from('chat_history').insert([
+            { user_id: userId, role: 'user', message: message },
+            { user_id: userId, role: 'model', message: aiResponse }
+        ]);
+
+        res.status(200).json({ reply: aiResponse });
+
+    } catch (error) {
+        console.error("Teacher chat error:", error);
+        res.status(500).json({ error: "Ошибка ассистента. Попробуйте позже." });
+    }
+});
+
 // Эндпоинт для получения истории сообщений при открытии чата
 app.get('/api/ai/history/:userId', async (req, res) => {
     const { data, error } = await supabase
@@ -1627,12 +1730,35 @@ app.get('/api/teacher/reports', async (req, res) => {
 // === 📚 УМКД / ПОӘК ЭНДПОИНТТЕРІ ===
 // =============================================
 
-// Студенттің пәндер тізімі + УМКД бар-жоғы
+const multer = require('multer');
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+});
+
+// Тек оқытушыға рұқсат беретін middleware
+const checkTeacherRole = async (req, res, next) => {
+    try {
+        const { data: staffMember } = await supabase
+            .from('staff')
+            .select('id')
+            .eq('id', req.user.id)
+            .single();
+
+        if (!staffMember) {
+            return res.status(403).json({ error: 'Тек оқытушыларға рұқсат бар' });
+        }
+        next();
+    } catch (error) {
+        res.status(403).json({ error: 'Рол тексеру қатесі' });
+    }
+};
+
+// Студенттің пәндер тізімі + УМКД бар-жоғы (студент + оқытушы)
 app.get('/api/umkd/student/:studentId', authenticateUser, async (req, res) => {
     try {
         const { studentId } = req.params;
 
-        // Студенттің тобын аламыз
         const { data: profile, error: profileError } = await supabase
             .from('profiles')
             .select('group_id')
@@ -1643,7 +1769,6 @@ app.get('/api/umkd/student/:studentId', authenticateUser, async (req, res) => {
             return res.status(404).json({ error: 'Студент немесе топ табылмады' });
         }
 
-        // Топтың бағдарламасын аламыз
         const { data: group, error: groupError } = await supabase
             .from('groups')
             .select('program_id, academic_year')
@@ -1654,7 +1779,6 @@ app.get('/api/umkd/student/:studentId', authenticateUser, async (req, res) => {
             return res.status(404).json({ error: 'Топтың бағдарламасы табылмады' });
         }
 
-        // Бағдарламаға байланысты пәндерді аламыз
         const { data: programSubjects, error: psError } = await supabase
             .from('program_subjects')
             .select('subject_id, subjects(id, name)')
@@ -1664,7 +1788,6 @@ app.get('/api/umkd/student/:studentId', authenticateUser, async (req, res) => {
 
         const subjectIds = programSubjects.map(ps => ps.subject_id);
 
-        // Осы пәндер бойынша УМКД бар-жоғын тексереміз
         const { data: umkdList } = await supabase
             .from('umkd')
             .select('id, subject_id')
@@ -1687,7 +1810,7 @@ app.get('/api/umkd/student/:studentId', authenticateUser, async (req, res) => {
     }
 });
 
-// Пән бойынша УМКД мазмұны (барлық материалдармен)
+// Пән бойынша УМКД мазмұны — барлық материалдар (студент + оқытушы)
 app.get('/api/umkd/subject/:subjectId', authenticateUser, async (req, res) => {
     try {
         const { subjectId } = req.params;
@@ -1719,8 +1842,8 @@ app.get('/api/umkd/subject/:subjectId', authenticateUser, async (req, res) => {
     }
 });
 
-// УМКД жасау немесе жаңарту (оқытушы/әкімші)
-app.post('/api/umkd', authenticateUser, async (req, res) => {
+// УМКД жасау немесе жаңарту (тек оқытушы)
+app.post('/api/umkd', authenticateUser, checkTeacherRole, async (req, res) => {
     try {
         const { subject_id, semester, academic_year, description } = req.body;
 
@@ -1745,10 +1868,11 @@ app.post('/api/umkd', authenticateUser, async (req, res) => {
     }
 });
 
-// УМКД-ға материал қосу
-app.post('/api/umkd/material', authenticateUser, async (req, res) => {
+// Файл жүктеп, материал қосу (тек оқытушы)
+// multipart/form-data: file, umkd_id, title, type, content (міндетті емес)
+app.post('/api/umkd/upload', authenticateUser, checkTeacherRole, upload.single('file'), async (req, res) => {
     try {
-        const { umkd_id, title, type, file_url, content } = req.body;
+        const { umkd_id, title, type, content } = req.body;
 
         if (!umkd_id || !title || !type) {
             return res.status(400).json({ error: 'umkd_id, title, type міндетті' });
@@ -1759,7 +1883,36 @@ app.post('/api/umkd/material', authenticateUser, async (req, res) => {
             return res.status(400).json({ error: 'Жарамсыз материал түрі' });
         }
 
-        // order_index автоматты түрде ең соңына қою
+        let file_url = null;
+
+        if (req.file) {
+            // Supabase Storage-ге жүктеу
+            const ext = (req.file.originalname.split('.').pop() || 'bin').replace(/[^\w]/g, '');
+            // Кириллицу и спецсимволы убираем — оставляем только латиницу, цифры и дефис
+            const safeTitle = title
+                .replace(/\s+/g, '_')
+                .replace(/[^\w\-]/g, '')  // удалить всё кроме [a-zA-Z0-9_-]
+                || 'file';
+            const storagePath = `${umkd_id}/${Date.now()}_${safeTitle}.${ext}`;
+
+            const { error: uploadError } = await supabase.storage
+                .from('umkd-files')
+                .upload(storagePath, req.file.buffer, {
+                    contentType: req.file.mimetype,
+                    upsert: false,
+                });
+
+            if (uploadError) throw uploadError;
+
+            // Публичный URL алу
+            const { data: urlData } = supabase.storage
+                .from('umkd-files')
+                .getPublicUrl(storagePath);
+
+            file_url = urlData.publicUrl;
+        }
+
+        // order_index — ең соңына қою
         const { count } = await supabase
             .from('umkd_materials')
             .select('id', { count: 'exact', head: true })
@@ -1767,23 +1920,43 @@ app.post('/api/umkd/material', authenticateUser, async (req, res) => {
 
         const { data, error } = await supabase
             .from('umkd_materials')
-            .insert({ umkd_id, title, type, file_url, content, order_index: count || 0 })
+            .insert({ umkd_id, title, type, file_url, content: content || null, order_index: count || 0 })
             .select()
             .single();
 
         if (error) throw error;
         res.json(data);
     } catch (error) {
-        console.error('addUmkdMaterial error:', error);
+        console.error('uploadUmkdMaterial error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Материалды жою
-app.delete('/api/umkd/material/:id', authenticateUser, async (req, res) => {
+// Материалды жою + файлды Storage-тен өшіру (тек оқытушы)
+app.delete('/api/umkd/material/:id', authenticateUser, checkTeacherRole, async (req, res) => {
     try {
         const { id } = req.params;
 
+        // Алдымен file_url алу (Storage-тен өшіру үшін)
+        const { data: material } = await supabase
+            .from('umkd_materials')
+            .select('file_url, umkd_id')
+            .eq('id', id)
+            .single();
+
+        // Файл болса — Storage-тен өшіру
+        if (material?.file_url) {
+            const url = new URL(material.file_url);
+            // URL-ден bucket аты мен path алу: /storage/v1/object/public/umkd-files/PATH
+            const parts = url.pathname.split('/umkd-files/');
+            if (parts.length === 2) {
+                await supabase.storage
+                    .from('umkd-files')
+                    .remove([decodeURIComponent(parts[1])]);
+            }
+        }
+
+        // Базадан өшіру
         const { error } = await supabase
             .from('umkd_materials')
             .delete()
